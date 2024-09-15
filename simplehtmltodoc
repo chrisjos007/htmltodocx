@@ -1,0 +1,373 @@
+import re
+
+from docx.table import _Cell
+from docx.shared import Inches
+from bs4 import BeautifulSoup
+from doc_patch import list_number, add_hyperlink
+
+
+class CustomHtmlDocx:
+    """
+    Note: Remember previous here is not the previous line, but the previous element of the same line
+    """
+
+    FONT_STYLES = {
+        "b": "bold",
+        "strong": "bold",
+        "em": "italic",
+        "i": "italic",
+        "u": "underline",
+        "s": "strike",
+        "sup": "superscript",
+        "sub": "subscript",
+        "th": "bold",
+    }
+    TABLE_STYLE = "Table Grid"
+
+    NEWLINE = "\n"
+    BREAK_TAG = "br"
+
+    def __init__(self) -> None:
+        self.doc = None
+
+    def init_doc(self, doc):
+        self.doc = doc
+
+    @classmethod
+    def set_vertical_alignment_for_all_tables(doc, align):
+        """
+        use this in case we want to vertically center align the table contents
+        """
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    cell.vertical_alignment = align
+
+    def add_html_to_doc(self, location, html_string, soup=None):
+        soup = BeautifulSoup(html_string.strip(), "html.parser")
+
+        # setting previous paragraph as empty
+        prev = None
+
+        # All cells will have empty paragraph element
+        if isinstance(location, _Cell):
+            prev = location.paragraphs[0]
+
+        for element in soup.children:
+            if (
+                isinstance(element, str) and element.isspace()
+            ) or element.name == self.BREAK_TAG:
+                continue
+            try:
+                self.check_parent_conditions(location, element, prev=prev)
+            except Exception as e:
+                print("Error: ", e)
+                continue
+            finally:
+                # we dont want to identify at the top level what the next element links to
+                prev = None
+
+    def check_parent_conditions(self, loc, element, prev=None):
+        """
+        Called as the initial point of parsing html line by line
+
+        This is the handler for non list items
+
+        loc: docx.Document/docx.table._Cell
+            location for insertion of data
+        element: Str/BeautifulSoup element
+            can be string or html soup stuff
+        prev: docx Paragraph
+            In case insertions are needed at a specific paragraph
+            Here prev is to keep track of only whether its a single line string.
+        """
+        p = None
+        if isinstance(element, str):
+            # for plain paragraphs add new or update based on previous
+            # and set the current paragraph as the new previous
+            text = element.replace("\xa0", " ")
+            if prev:
+                prev.add_run(text)
+                return prev
+            else:
+                p = loc.add_paragraph(element)
+        elif element.name == self.BREAK_TAG:
+            prev.add_run(self.NEWLINE)
+            return prev
+
+        elif re.match("h[1-9]", element.name):
+            if isinstance(loc, _Cell):
+                if prev:
+                    heading = prev.add_run(element.get_text())
+                else:
+                    heading = loc.add_paragraph().add_run(element.get_text())
+                heading.bold = True
+            else:
+                loc.add_heading(element.get_text(), int(element.name[1]))
+
+        elif element.name in ["html", "body", "div"]:
+            # not sure if this works
+            for element in element.contents:
+                prev = self.check_parent_conditions(loc, element, prev=prev)
+
+        elif element.name == "table":
+            # Insert table at the location
+            self.add_table_in_place(loc, element)
+
+        elif element.name in ["ul", "ol"]:
+            # list parsing is handled directly in the function
+            self.check_child_tags(loc, element, prev=prev)
+
+        elif element.name in self.FONT_STYLES:
+            # Idea here is that we identify whether its a starting of a line
+            # or in between so that we could know which handler to call
+            if not prev:
+                prev = self.check_parent_conditions(loc, "")
+            return self.add_styling_in_place(element, prev)
+
+        elif element.name in ["p", "span", "form", "pre"]:
+            # This could have been part of the else condition but
+            # some text such as <td><p>#@@# test</p><p>data&nbsp;</p><p>simulator</p></td>
+            # are not getting populated inside the table
+            for i in element.contents:
+                prev = self.check_parent_conditions(loc, i, prev)
+            return prev
+
+        elif element.name == "a":
+            if not prev:
+                prev = self.check_parent_conditions(loc, "")
+            add_hyperlink(prev, element["href"], element.text)
+            return prev
+
+        elif element.name == "img":
+            # Adding image at the base level
+            p = self.check_parent_conditions(
+                loc, "", prev=prev
+            )  # passing previous so that cell images start at top
+            self.add_picture_in_place(element, p)
+            p = None  # Images need not have a continuing sentence
+        # else:
+        #     self.check_parent_conditions(loc, element.get_text())
+        return p  # For consistency
+
+    def check_child_tags(self, loc, element, counter=0, st=None, prev=None):
+        """
+        Called for listing tags (ol, ul) inside html
+
+        This is the handler for list items
+
+        loc: docx.Document/docx.table._Cell
+            location for insertion of data
+        element: Str/BeautifulSoup element
+            can be string or html soup stuff
+        counter: Integer
+            determines what the indentation we need to provide for lists
+        st: Integer
+            tracks the current loop position within a list so that numbering can be reset
+        prev: docx Paragraph
+            In case insertions are needed at a specific paragraph
+        """
+        p = None  # this is the current paragraph
+
+        if isinstance(element, str):
+            text = element
+            if text == " ":
+                return prev
+            if element.strip():
+                # text = "\n".join(map(str.strip, element.split("\n")))             # previous impl
+                text = text.replace("\xa0", " ")
+
+            n_style = "List Number"
+            if st == "*":
+                n_style = "List Bullet"
+            if counter > 1:
+                n_style = f"{n_style} {counter}"
+
+            if prev:
+                # in case there is an existing para and we need to add new lines
+                # without numbering those new lines
+                prev.add_run(text)
+                if len(prev.runs) == 1:
+                    # this condition is specific when starting cell with lists
+                    prev.style = self.doc.styles[n_style]
+                p = prev
+            else:
+                p = loc.add_paragraph(text, style=n_style)
+            if st == 1:
+                list_number(loc, p)
+            return p
+
+        elif element.name in ["p", "span", "form", "pre"]:
+            # Insert paragraphs
+            for i in element.contents:
+                prev = self.check_child_tags(loc, i, counter, st, prev)
+            return prev
+
+        elif element.name == "a":
+            if not prev:
+                prev = self.check_child_tags(loc, "", counter, st)
+            add_hyperlink(prev, element["href"], element.text)
+            return prev
+        elif element.name in self.FONT_STYLES:
+            if not prev:
+                prev = self.check_child_tags(loc, "", counter, st)
+            return self.add_styling_in_place(element, prev)
+
+        elif element.name == "table":
+            # Insert tables
+            self.add_table_in_place(loc, element)
+
+        elif element.name == "img":
+            p = self.check_child_tags(loc, "", counter, st)
+            self.add_picture_in_place(element, p)
+
+        elif element.name == self.BREAK_TAG:
+            p = self.check_child_tags(loc, self.NEWLINE, counter, st, prev=prev)
+
+        elif element.name == "li":
+            # the counter increment below instead of at parent
+            # because there can be other-than non li in the parent
+            counter += 1
+            for i in element.children:
+                # if prev and i.name != self.BREAK_TAG:
+                #     counter += 1
+                prev = self.check_child_tags(loc, i, counter, st, prev=prev)
+
+        elif element.name in ["ol", "ul"]:
+            if prev and prev.runs:
+                prev = None
+            for st, i in enumerate(element.find_all(recursive=False)):
+                reset_tracker = "*" if element.name == "ul" else st + 1
+                self.check_child_tags(loc, i, counter, reset_tracker, prev=prev)
+                prev = None
+            return
+        return p
+
+    def add_styling_in_place(self, element, prev):
+        """
+        Adds styling Bold, Italic, Underline, ...
+
+        elem: BeautifulSoup tag object
+            ex: <em>Some text</em>
+
+        prev: Python docx paragraph object
+            called previous because the text where styling is applied
+            is considered to be continuation of an existing text paragraph
+        """
+        new_run = prev.add_run(element.get_text())
+        setattr(new_run.font, self.FONT_STYLES[element.name], True)
+        for i in element.find_all(recursive=False):
+            if i.name in self.FONT_STYLES:
+                setattr(new_run.font, self.FONT_STYLES[i.name], True)
+        return prev
+
+    def add_picture_in_place(self, element, para):
+        """
+        Adds picture to the paragraph
+
+        elem: BeautifulSoup tag object
+            ex: <img src="Picture1.jpg">
+
+        para: Python docx paragraph object
+        """
+        try:
+            image = element["src"]
+            para.add_run().add_picture(image, width=Inches(2), height=Inches(2))
+        except Exception as e:
+            print("Error: ", e)
+            para.add_run(image)
+
+    def _unwrap_elements(self, soup_element, removables):
+        """
+        Removes tags that doesnt matter
+        """
+        for i in removables:
+            it = soup_element.find(i)
+            if it:
+                it.unwrap()
+
+    def add_table_in_place(self, loc, soup_element):
+        """
+        Adds table to the location
+
+        loc: python docx document or table cell
+
+        soup_element: BeautifulSoup tag object
+        """
+        self._unwrap_elements(soup_element, ["tbody", "thead"])
+
+        inner_rows = soup_element.find_all("tr", recursive=False)
+        row_size = len(inner_rows)
+        col_size = len(
+            inner_rows[0].find_all(
+                ["th", "td"],
+                recursive=False,
+            )
+        )
+        if not row_size or not col_size:
+            return
+
+        span_matrix = [[0] * col_size for _ in range(row_size)]
+        inner = loc.add_table(
+            rows=row_size,
+            cols=col_size,
+        )
+        inner.style = self.TABLE_STYLE
+        for i, row in enumerate(inner_rows):
+            for j, cell_content in enumerate(
+                row.find_all(["th", "td"], recursive=False)
+            ):
+                counter = j
+                rowspan = cell_content.get("rowspan", "0")
+                colspan = cell_content.get("colspan", "0")
+                # inner_cell = word_row[j]
+                try:
+                    for n in range(1, int(rowspan)):
+                        span_matrix[i + n][j] = 1
+                        inner.cell(i, j).merge(inner.cell(i + n, j))
+                    while span_matrix[i][counter] == 1:
+                        counter += 1
+                except:
+                    pass
+                try:
+                    for n in range(1, int(colspan)):
+                        span_matrix[i][j + n] = 1
+                        inner.cell(i, j).merge(inner.cell(i, j + n))
+                except:
+                    pass
+                inner_cell = inner.cell(i, counter)
+
+                prev = inner_cell.paragraphs[0]
+                for k in cell_content.contents:
+                    if k.name == self.BREAK_TAG and prev:
+                        prev.add_run(self.NEWLINE)
+                    else:
+                        prev = self.check_parent_conditions(inner_cell, k, prev=prev)
+                span_matrix[i][counter] = 1
+
+    def __del__(self):
+        # Align all the table contents at the end
+        # if self.doc:
+        #     self.set_vertical_alignment_for_all_tables(
+        #         self.doc, WD_ALIGN_VERTICAL.CENTER
+        #     )
+        pass
+
+
+if __name__ == "__main__":
+    import docx
+
+    doc = docx.Document()
+    # t = doc.add_table(rows=2, cols=2)
+    # t.style = "Table Grid"
+    # cell_1 = t.cell(0, 0)
+    # cell_1.add_paragraph("simple test")
+    # cell_1.width = Inches(2)
+    # cell_2 = t.cell(0, 1)
+
+    h = """<p><img alt="see attached image: sample.mp4" src="sample.mp4" /></p>"""
+    h = h.replace("\n", "").replace("\t", "")
+    c = CustomHtmlDocx()
+    c.add_html_to_doc(doc, h)
+    # cell_2.width = Inches(8)
+    doc.save("test.docx")
